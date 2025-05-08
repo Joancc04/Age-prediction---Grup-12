@@ -23,10 +23,15 @@ from PIL import Image
 
 torch.backends.cudnn.deterministic = True
 
-TRAIN_CSV_PATH = './afad_train.csv'
-VALID_CSV_PATH = './afad_valid.csv'
-TEST_CSV_PATH = './afad_test.csv'
-IMAGE_PATH = '/shared_datasets/AFAD/orig/tarball/AFAD-Full'
+TRAIN_CSV_PATH = './train.csv'
+VALID_CSV_PATH = './valid.csv'
+TEST_CSV_PATH = './test.csv'
+IMAGE_PATH = ''
+
+# TRAIN_CSV_PATH = './afad_train.csv'
+# VALID_CSV_PATH = './afad_valid.csv'
+# TEST_CSV_PATH = './afad_test.csv'
+# IMAGE_PATH = '/shared_datasets/AFAD/orig/tarball/AFAD-Full'
 
 
 # Argparse helper
@@ -101,10 +106,10 @@ with open(LOGFILE, 'w') as f:
 
 # Hyperparameters
 learning_rate = 0.0005
-num_epochs = 200
+num_epochs = 2
 
 # Architecture
-NUM_CLASSES = 26
+NUM_CLASSES = 31
 BATCH_SIZE = 256
 GRAYSCALE = False
 
@@ -156,18 +161,21 @@ class AFADDatasetAge(Dataset):
         self.y = df['age'].values
         self.transform = transform
 
-    def __getitem__(self, index):
-        img = Image.open(os.path.join(self.img_dir,
-                                      self.img_paths[index]))
+    def __getitem__(self, idx):
+        img_path = self.img_paths.iloc[idx]
+        image = Image.open(img_path).convert("RGB")
 
-        if self.transform is not None:
-            img = self.transform(img)
+        if self.transform:
+            image = self.transform(image)
 
-        label = self.y[index]
-        levels = [1]*label + [0]*(NUM_CLASSES - 1 - label)
-        levels = torch.tensor(levels, dtype=torch.float32)
+        label = self.y[idx]
+        label_tensor = torch.tensor(label, dtype=torch.long)
 
-        return img, label, levels
+        # CORAL levels vector (1 for k < label, 0 for k >= label)
+        levels = torch.tensor([1 if i < label else 0 for i in range(NUM_CLASSES - 1)], dtype=torch.float32)
+
+        return image, label_tensor, levels
+
 
     def __len__(self):
         return self.y.shape[0]
@@ -348,15 +356,17 @@ optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 
 def compute_mae_and_mse(model, data_loader, device):
-    mae, mse, num_examples = 0, 0, 0
+    mae = torch.tensor(0.0, device=device)
+    mse = torch.tensor(0.0, device=device)
+    num_examples = 0
     for i, (features, targets, levels) in enumerate(data_loader):
 
         features = features.to(device)
         targets = targets.to(device)
 
         logits, probas = model(features)
-        predict_levels = probas > 0.5
-        predicted_labels = torch.sum(predict_levels, dim=1)
+        predict_levels = (probas > 0.5).to(device)
+        predicted_labels = torch.sum(predict_levels, dim=1).to(device)
         num_examples += targets.size(0)
         mae += torch.sum(torch.abs(predicted_labels - targets))
         mse += torch.sum((predicted_labels - targets)**2)
@@ -364,121 +374,126 @@ def compute_mae_and_mse(model, data_loader, device):
     mse = mse.float() / num_examples
     return mae, mse
 
+def main():
 
-start_time = time.time()
+    start_time = time.time()
 
-best_mae, best_rmse, best_epoch = 999, 999, -1
-for epoch in range(num_epochs):
+    best_mae, best_rmse, best_epoch = 999, 999, -1
+    for epoch in range(num_epochs):
 
-    model.train()
-    for batch_idx, (features, targets, levels) in enumerate(train_loader):
+        model.train()
+        for batch_idx, (features, targets, levels) in enumerate(train_loader):
 
-        features = features.to(DEVICE)
-        targets = targets
-        targets = targets.to(DEVICE)
-        levels = levels.to(DEVICE)
+            features = features.to(DEVICE)
+            targets = targets
+            targets = targets.to(DEVICE)
+            levels = levels.to(DEVICE)
 
-        # FORWARD AND BACK PROP
-        logits, probas = model(features)
-        cost = cost_fn(logits, levels, imp)
-        optimizer.zero_grad()
+            # FORWARD AND BACK PROP
+            logits, probas = model(features)
+            cost = cost_fn(logits, levels, imp)
+            optimizer.zero_grad()
 
-        cost.backward()
+            cost.backward()
 
-        # UPDATE MODEL PARAMETERS
-        optimizer.step()
+            # UPDATE MODEL PARAMETERS
+            optimizer.step()
 
-        # LOGGING
-        if not batch_idx % 50:
-            s = ('Epoch: %03d/%03d | Batch %04d/%04d | Cost: %.4f'
-                 % (epoch+1, num_epochs, batch_idx,
-                     len(train_dataset)//BATCH_SIZE, cost))
-            print(s)
-            with open(LOGFILE, 'a') as f:
-                f.write('%s\n' % s)
+            # LOGGING
+            if not batch_idx % 50:
+                s = ('Epoch: %03d/%03d | Batch %04d/%04d | Cost: %.4f'
+                    % (epoch+1, num_epochs, batch_idx,
+                        len(train_dataset)//BATCH_SIZE, cost))
+                print(s)
+                with open(LOGFILE, 'a') as f:
+                    f.write('%s\n' % s)
+
+        model.eval()
+        with torch.set_grad_enabled(False):
+            valid_mae, valid_mse = compute_mae_and_mse(model, valid_loader,
+                                                    device=DEVICE)
+
+        if valid_mae < best_mae:
+            best_mae, best_rmse, best_epoch = valid_mae, torch.sqrt(valid_mse), epoch
+            ########## SAVE MODEL #############
+            torch.save(model.state_dict(), os.path.join(PATH, 'best_model.pt'))
+
+
+        s = 'MAE/RMSE: | Current Valid: %.2f/%.2f Ep. %d | Best Valid : %.2f/%.2f Ep. %d' % (
+            valid_mae, torch.sqrt(valid_mse), epoch, best_mae, best_rmse, best_epoch)
+        print(s)
+        with open(LOGFILE, 'a') as f:
+            f.write('%s\n' % s)
+
+        s = 'Time elapsed: %.2f min' % ((time.time() - start_time)/60)
+        print(s)
+        with open(LOGFILE, 'a') as f:
+            f.write('%s\n' % s)
 
     model.eval()
-    with torch.set_grad_enabled(False):
+    with torch.set_grad_enabled(False):  # save memory during inference
+
+        train_mae, train_mse = compute_mae_and_mse(model, train_loader,
+                                                device=DEVICE)
         valid_mae, valid_mse = compute_mae_and_mse(model, valid_loader,
-                                                   device=DEVICE)
+                                                device=DEVICE)
+        test_mae, test_mse = compute_mae_and_mse(model, test_loader,
+                                                device=DEVICE)
 
-    if valid_mae < best_mae:
-        best_mae, best_rmse, best_epoch = valid_mae, torch.sqrt(valid_mse), epoch
-        ########## SAVE MODEL #############
-        torch.save(model.state_dict(), os.path.join(PATH, 'best_model.pt'))
+        s = 'MAE/RMSE: | Train: %.2f/%.2f | Valid: %.2f/%.2f | Test: %.2f/%.2f' % (
+            train_mae, torch.sqrt(train_mse),
+            valid_mae, torch.sqrt(valid_mse),
+            test_mae, torch.sqrt(test_mse))
+        print(s)
+        with open(LOGFILE, 'a') as f:
+            f.write('%s\n' % s)
 
-
-    s = 'MAE/RMSE: | Current Valid: %.2f/%.2f Ep. %d | Best Valid : %.2f/%.2f Ep. %d' % (
-        valid_mae, torch.sqrt(valid_mse), epoch, best_mae, best_rmse, best_epoch)
-    print(s)
-    with open(LOGFILE, 'a') as f:
-        f.write('%s\n' % s)
-
-    s = 'Time elapsed: %.2f min' % ((time.time() - start_time)/60)
-    print(s)
-    with open(LOGFILE, 'a') as f:
-        f.write('%s\n' % s)
-
-model.eval()
-with torch.set_grad_enabled(False):  # save memory during inference
-
-    train_mae, train_mse = compute_mae_and_mse(model, train_loader,
-                                               device=DEVICE)
-    valid_mae, valid_mse = compute_mae_and_mse(model, valid_loader,
-                                               device=DEVICE)
-    test_mae, test_mse = compute_mae_and_mse(model, test_loader,
-                                             device=DEVICE)
-
-    s = 'MAE/RMSE: | Train: %.2f/%.2f | Valid: %.2f/%.2f | Test: %.2f/%.2f' % (
-        train_mae, torch.sqrt(train_mse),
-        valid_mae, torch.sqrt(valid_mse),
-        test_mae, torch.sqrt(test_mse))
-    print(s)
-    with open(LOGFILE, 'a') as f:
-        f.write('%s\n' % s)
-
-s = 'Total Training Time: %.2f min' % ((time.time() - start_time)/60)
-print(s)
-with open(LOGFILE, 'a') as f:
-    f.write('%s\n' % s)
-
-
-########## EVALUATE BEST MODEL ######
-model.load_state_dict(torch.load(os.path.join(PATH, 'best_model.pt')))
-model.eval()
-
-with torch.set_grad_enabled(False):
-    train_mae, train_mse = compute_mae_and_mse(model, train_loader,
-                                               device=DEVICE)
-    valid_mae, valid_mse = compute_mae_and_mse(model, valid_loader,
-                                               device=DEVICE)
-    test_mae, test_mse = compute_mae_and_mse(model, test_loader,
-                                             device=DEVICE)
-
-    s = 'MAE/RMSE: | Best Train: %.2f/%.2f | Best Valid: %.2f/%.2f | Best Test: %.2f/%.2f' % (
-        train_mae, torch.sqrt(train_mse),
-        valid_mae, torch.sqrt(valid_mse),
-        test_mae, torch.sqrt(test_mse))
+    s = 'Total Training Time: %.2f min' % ((time.time() - start_time)/60)
     print(s)
     with open(LOGFILE, 'a') as f:
         f.write('%s\n' % s)
 
 
-########## SAVE PREDICTIONS ######
-all_pred = []
-all_probas = []
-with torch.set_grad_enabled(False):
-    for batch_idx, (features, targets, levels) in enumerate(test_loader):
-        
-        features = features.to(DEVICE)
-        logits, probas = model(features)
-        all_probas.append(probas)
-        predict_levels = probas > 0.5
-        predicted_labels = torch.sum(predict_levels, dim=1)
-        lst = [str(int(i)) for i in predicted_labels]
-        all_pred.extend(lst)
+    ########## EVALUATE BEST MODEL ######
+    model.load_state_dict(torch.load(os.path.join(PATH, 'best_model.pt')))
+    model.eval()
 
-torch.save(torch.cat(all_probas).to(torch.device('cpu')), TEST_ALLPROBAS)
-with open(TEST_PREDICTIONS, 'w') as f:
-    all_pred = ','.join(all_pred)
-    f.write(all_pred)
+    with torch.set_grad_enabled(False):
+        train_mae, train_mse = compute_mae_and_mse(model, train_loader,
+                                                device=DEVICE)
+        valid_mae, valid_mse = compute_mae_and_mse(model, valid_loader,
+                                                device=DEVICE)
+        test_mae, test_mse = compute_mae_and_mse(model, test_loader,
+                                                device=DEVICE)
+
+        s = 'MAE/RMSE: | Best Train: %.2f/%.2f | Best Valid: %.2f/%.2f | Best Test: %.2f/%.2f' % (
+            train_mae, torch.sqrt(train_mse),
+            valid_mae, torch.sqrt(valid_mse),
+            test_mae, torch.sqrt(test_mse))
+        print(s)
+        with open(LOGFILE, 'a') as f:
+            f.write('%s\n' % s)
+
+
+    ########## SAVE PREDICTIONS ######
+    all_pred = []
+    all_probas = []
+    with torch.set_grad_enabled(False):
+        for batch_idx, (features, targets, levels) in enumerate(test_loader):
+            
+            features = features.to(DEVICE)
+            logits, probas = model(features)
+            all_probas.append(probas)
+            predict_levels = (probas > 0.5).to(DEVICE)
+            predicted_labels = torch.sum(predict_levels, dim=1).to(DEVICE)
+            lst = [str(int(i)) for i in predicted_labels]
+            all_pred.extend(lst)
+
+    all_probas = [torch.tensor(p) if not isinstance(p, torch.Tensor) else p for p in all_probas]
+    torch.save(torch.cat(all_probas).to(torch.device('cpu')), TEST_ALLPROBAS)
+    with open(TEST_PREDICTIONS, 'w') as f:
+        all_pred = ','.join(all_pred)
+        f.write(all_pred)
+
+if __name__ == '__main__':
+    main()

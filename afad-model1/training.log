@@ -1,0 +1,9 @@
+PyTorch Version: 2.7.0+cu118
+CUDA device available: True
+Using CUDA device: cuda:0
+Random Seed: 1
+Task Importance Weight: 0
+Output Path: afad-model1
+Script: C:\Users\crbsk\Documents\GitHub\Age-prediction---Grup-12\coral-cnn-master\model-code\afad-coral.py
+MAE/RMSE: | Train: 8.43/10.13 | Valid: nan/nan | Test: 8.39/10.04
+Total Training Time: 2.86 min
